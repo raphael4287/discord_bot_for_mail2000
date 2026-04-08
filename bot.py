@@ -9,7 +9,6 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
-import traceback
 
 load_dotenv()
 
@@ -65,7 +64,7 @@ def _fetch_sync():
         _, data = mail.search(None, "UNSEEN")
         email_ids = data[0].split() if data and data[0] else []
         emails = []
-        for num in email_ids[:15]:  # 限制數量避免卡住
+        for num in email_ids[:15]:
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
@@ -113,16 +112,15 @@ def _fetch_sync():
             except:
                 pass
 
-# ================== 新 Filter 邏輯（包含型） ==================
+# ================== Filter 邏輯（排除型）==================
 def should_send(email_data: dict, filters: list, filter_enabled: bool):
-    if not filter_enabled:
-        return True  # filter 關閉 → 全部轉發
-
-    if not filters:
+    """Filter 關閉 或 沒有關鍵字 → 全部轉發
+       Filter 開啟 → 含有任一關鍵字的郵件直接擋掉"""
+    if not filter_enabled or not filters:
         return True
 
     text = f"{email_data.get('subject','')} {email_data.get('from','')} {email_data.get('body','')}".lower()
-    return any(kw.lower() in text for kw in filters if kw)
+    return not any(kw.lower() in text for kw in filters if kw)  # 不包含任何關鍵字才轉發
 
 async def send_to_channel(channel, emails, filters, filter_enabled):
     count = 0
@@ -137,10 +135,10 @@ async def send_to_channel(channel, emails, filters, filter_enabled):
             embed.add_field(name="寄件人", value=mail["from"], inline=False)
             embed.add_field(name="時間", value=mail["date"], inline=False)
 
-            status = "✅ 已啟用（僅含關鍵字）" if filter_enabled and filters else "❌ 已關閉（全部轉發）"
+            status = "✅ 已啟用（排除關鍵字）" if filter_enabled and filters else "❌ 已關閉（全部轉發）"
             filter_text = " | ".join(filters) if filters else "無關鍵字"
             
-            embed.set_footer(text=f"Mail2000 自動轉發 • Filter 狀態: {status} | 關鍵字: {filter_text}")
+            embed.set_footer(text=f"Mail2000 自動轉發 • Filter 狀態: {status} | 排除關鍵字: {filter_text}")
             
             try:
                 await channel.send(embed=embed)
@@ -179,7 +177,7 @@ async def background_check():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================== 指令 ==================
-@tree.command(name="set_channel", description="設定接收郵件/公告的頻道")
+@tree.command(name="set_channel", description="設定接收郵件/公告的頻道（必須先設定）")
 @app_commands.describe(channel="目標文字頻道")
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     gid = str(interaction.guild_id)
@@ -189,7 +187,7 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
     save_config()
     await interaction.response.send_message(f"✅ 已設定轉發頻道為 {channel.mention}", ephemeral=True)
 
-@tree.command(name="add_filter", description="新增關鍵字（只有包含這些關鍵字的郵件才會轉發）")
+@tree.command(name="add_filter", description="新增排除關鍵字（含有這些詞的郵件將被擋掉）")
 @app_commands.describe(keyword="關鍵字")
 async def add_filter(interaction: discord.Interaction, keyword: str):
     gid = str(interaction.guild_id)
@@ -198,31 +196,33 @@ async def add_filter(interaction: discord.Interaction, keyword: str):
 
     if keyword not in config[gid]["filters"]:
         config[gid]["filters"].append(keyword)
-        # 只要有關鍵字就自動開啟 filter
         config[gid]["filter_enabled"] = True
         save_config()
-        await interaction.response.send_message(f"✅ 已新增關鍵字：`{keyword}`\nFilter 已自動啟用（僅轉發包含關鍵字的郵件）", ephemeral=True)
+        await interaction.response.send_message(
+            f"✅ 已新增**排除關鍵字**：`{keyword}`\n"
+            "Filter 已自動啟用 → 含有這些關鍵字的郵件將不會轉發",
+            ephemeral=True
+        )
     else:
         await interaction.response.send_message("❌ 此關鍵字已存在", ephemeral=True)
 
-@tree.command(name="remove_filter", description="移除關鍵字")
+@tree.command(name="remove_filter", description="移除排除關鍵字")
 @app_commands.describe(keyword="關鍵字")
 async def remove_filter(interaction: discord.Interaction, keyword: str):
     gid = str(interaction.guild_id)
     if gid in config and keyword in config[gid].get("filters", []):
         config[gid]["filters"].remove(keyword)
         
-        # 如果關鍵字清空，自動關閉 filter
         if not config[gid]["filters"]:
             config[gid]["filter_enabled"] = False
             
         save_config()
-        status = "（目前無關鍵字，Filter 已關閉 → 全部轉發）" if not config[gid]["filters"] else ""
-        await interaction.response.send_message(f"✅ 已移除關鍵字：`{keyword}`{status}", ephemeral=True)
+        status = "（目前無排除關鍵字，Filter 已關閉 → 全部轉發）" if not config[gid]["filters"] else ""
+        await interaction.response.send_message(f"✅ 已移除排除關鍵字：`{keyword}`{status}", ephemeral=True)
     else:
         await interaction.response.send_message("❌ 找不到此關鍵字", ephemeral=True)
 
-@tree.command(name="list_filters", description="查看目前關鍵字與 Filter 狀態")
+@tree.command(name="list_filters", description="查看目前排除關鍵字與 Filter 狀態")
 async def list_filters(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
     data = config.get(gid, {})
@@ -231,20 +231,20 @@ async def list_filters(interaction: discord.Interaction):
 
     if not filters:
         await interaction.response.send_message(
-            "目前沒有設定任何關鍵字\n"
+            "目前沒有設定任何排除關鍵字\n"
             "**Filter 狀態：已關閉** → 所有新郵件都會轉發",
             ephemeral=True
         )
         return
 
-    status = "✅ 已啟用（僅轉發包含以下任一關鍵字的郵件）" if filter_enabled else "❌ 已關閉"
+    status = "✅ 已啟用（含有以下任一關鍵字的郵件將被擋掉）" if filter_enabled else "❌ 已關閉"
     await interaction.response.send_message(
         f"**Filter 狀態：** {status}\n\n"
-        "關鍵字列表：\n" + "\n".join(f"• `{f}`" for f in filters),
+        "排除關鍵字列表：\n" + "\n".join(f"• `{f}`" for f in filters),
         ephemeral=True
     )
 
-@tree.command(name="toggle_filter", description="手動開啟/關閉 Filter")
+@tree.command(name="toggle_filter", description="手動開啟/關閉排除 Filter")
 async def toggle_filter(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
     if gid not in config:
@@ -253,14 +253,13 @@ async def toggle_filter(interaction: discord.Interaction):
     current = config[gid].get("filter_enabled", False)
     config[gid]["filter_enabled"] = not current
     
-    # 如果沒有關鍵字但想開啟，提示先加關鍵字
     if config[gid]["filter_enabled"] and not config[gid].get("filters"):
         config[gid]["filter_enabled"] = False
-        await interaction.response.send_message("❌ 請先使用 `/add_filter` 新增關鍵字後才能開啟 Filter", ephemeral=True)
+        await interaction.response.send_message("❌ 請先使用 `/add_filter` 新增排除關鍵字後才能開啟 Filter", ephemeral=True)
         return
 
     save_config()
-    status = "✅ **已開啟**（僅轉發包含關鍵字的郵件）" if config[gid]["filter_enabled"] else "❌ **已關閉**（全部轉發）"
+    status = "✅ **已開啟**（排除模式：含有關鍵字的郵件不會轉發）" if config[gid]["filter_enabled"] else "❌ **已關閉**（全部轉發）"
     await interaction.response.send_message(f"Filter 狀態切換成功！\n{status}", ephemeral=True)
 
 @tree.command(name="check_now", description="立刻手動檢查一次新郵件")

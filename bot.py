@@ -42,14 +42,13 @@ def save_config():
 
 load_config()
 
-# ================== 改良的 IMAP 函式（加上超時） ==================
+# ================== 改良的 IMAP 函式 ==================
 async def fetch_new_emails():
     try:
-        # 在執行緒中執行阻塞的 IMAP 操作，避免卡住主事件循環
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
             loop.run_in_executor(None, _fetch_emails_sync),
-            timeout=25.0  # 最多等 25 秒
+            timeout=25.0
         )
     except asyncio.TimeoutError:
         logger.error("IMAP 連線超時")
@@ -60,6 +59,7 @@ async def fetch_new_emails():
         return []
 
 def _fetch_emails_sync():
+    mail = None
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=20)
         mail.login(EMAIL, PASSWORD)
@@ -69,7 +69,7 @@ def _fetch_emails_sync():
         email_ids = data[0].split()
 
         emails = []
-        for num in email_ids[:10]:  # 一次最多處理 10 封，避免太多
+        for num in email_ids[:15]:   # 限制一次最多 15 封
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
                 raw_email = msg_data[0][1]
@@ -81,8 +81,8 @@ def _fetch_emails_sync():
                     if isinstance(subject, bytes):
                         subject = subject.decode(encoding or "utf-8", errors="replace")
 
-                from_ = msg["From"]
-                date_str = msg["Date"]
+                from_ = msg["From"] or "未知寄件人"
+                date_str = msg["Date"] or "未知時間"
 
                 body = ""
                 if msg.is_multipart():
@@ -95,9 +95,9 @@ def _fetch_emails_sync():
 
                 emails.append({
                     "subject": subject or "無主旨",
-                    "from": from_ or "未知寄件人",
-                    "date": date_str or "未知時間",
-                    "body": body[:1200] + "..." if len(body) > 1200 else body,
+                    "from": from_,
+                    "date": date_str,
+                    "body": body[:1300] + "..." if len(body) > 1300 else body,
                 })
             except:
                 continue
@@ -109,24 +109,45 @@ def _fetch_emails_sync():
             except:
                 pass
 
-        mail.close()
-        mail.logout()
         return emails
 
     except Exception as e:
         logger.error(f"同步 IMAP 錯誤: {e}")
         return []
     finally:
-        try:
-            mail.logout()
-        except:
-            pass
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
 
 def matches_filter(email_data: dict, keywords: list):
     if not keywords:
         return True
-    text = f"{email_data['subject']} {email_data['from']} {email_data['body']}".lower()
+    text = f"{email_data.get('subject','')} {email_data.get('from','')} {email_data.get('body','')}".lower()
     return any(kw.lower() in text for kw in keywords)
+
+# ================== 發送郵件到 Discord 的共用函式 ==================
+async def send_emails_to_channel(channel, emails, filters):
+    sent_count = 0
+    for mail in emails:
+        if matches_filter(mail, filters):
+            embed = discord.Embed(
+                title=f"📧 新郵件：{mail['subject']}",
+                description=mail["body"],
+                color=0x00ff88,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="寄件人", value=mail["from"], inline=False)
+            embed.add_field(name="時間", value=mail["date"], inline=False)
+            embed.set_footer(text=f"Mail2000 自動轉發 • Filter: {' | '.join(filters) if filters else '全部'}")
+
+            try:
+                await channel.send(embed=embed)
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"發送訊息失敗: {e}")
+    return sent_count
 
 # ================== Discord Bot ==================
 intents = discord.Intents.default()
@@ -136,7 +157,7 @@ tree = app_commands.CommandTree(client)
 
 @client.event
 async def on_ready():
-    logger.info(f"✅ {client.user} 已上線！")
+    logger.info(f"✅ {client.user} 已成功上線！")
     await tree.sync()
     logger.info("✅ 指令同步完成")
     asyncio.create_task(background_check())
@@ -144,11 +165,11 @@ async def on_ready():
 async def background_check():
     await client.wait_until_ready()
     while True:
-        logger.info(f"[{datetime.now()}] 開始檢查信箱...")
+        logger.info(f"[{datetime.now()}] 背景檢查信箱...")
         emails = await fetch_new_emails()
         
         if emails:
-            logger.info(f"發現 {len(emails)} 封新郵件")
+            logger.info(f"發現 {len(emails)} 封新郵件，開始轉發...")
             for guild_id, data in list(config.items()):
                 channel_id = data.get("channel_id")
                 filters = data.get("filters", [])
@@ -156,29 +177,12 @@ async def background_check():
                     continue
 
                 channel = client.get_channel(int(channel_id))
-                if not channel:
-                    continue
-
-                for mail in emails:
-                    if matches_filter(mail, filters):
-                        embed = discord.Embed(
-                            title=f"📧 新郵件：{mail['subject']}",
-                            description=mail["body"],
-                            color=0x00ff88,
-                            timestamp=datetime.now()
-                        )
-                        embed.add_field(name="寄件人", value=mail["from"], inline=False)
-                        embed.add_field(name="時間", value=mail["date"], inline=False)
-                        embed.set_footer(text=f"Mail2000 轉發 • Filter: {' | '.join(filters) if filters else '全部'}")
-
-                        try:
-                            await channel.send(embed=embed)
-                        except Exception as e:
-                            logger.error(f"發送 Discord 訊息失敗: {e}")
+                if channel:
+                    await send_emails_to_channel(channel, emails, filters)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ================== 指令（保持不變） ==================
+# ================== 指令 ==================
 @tree.command(name="set_channel", description="設定要轉發郵件的頻道")
 @app_commands.describe(channel="要接收通知的文字頻道")
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -189,14 +193,65 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
     save_config()
     await interaction.response.send_message(f"✅ 已設定轉發到 {channel.mention}", ephemeral=True)
 
-# 其他 add_filter、remove_filter、list_filters、check_now 指令保持原樣
-# （為了節省篇幅這裡省略，你可以保留你原本的）
+@tree.command(name="add_filter", description="新增過濾關鍵字")
+@app_commands.describe(keyword="關鍵字")
+async def add_filter(interaction: discord.Interaction, keyword: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in config:
+        config[guild_id] = {"filters": [], "channel_id": None}
+    if keyword not in config[guild_id]["filters"]:
+        config[guild_id]["filters"].append(keyword)
+        save_config()
+        await interaction.response.send_message(f"✅ 已新增關鍵字：`{keyword}`", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 關鍵字已存在", ephemeral=True)
 
-@tree.command(name="check_now", description="立刻手動檢查一次信箱")
+@tree.command(name="remove_filter", description="移除過濾關鍵字")
+@app_commands.describe(keyword="要移除的關鍵字")
+async def remove_filter(interaction: discord.Interaction, keyword: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id in config and keyword in config[guild_id]["filters"]:
+        config[guild_id]["filters"].remove(keyword)
+        save_config()
+        await interaction.response.send_message(f"✅ 已移除關鍵字：`{keyword}`", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ 找不到此關鍵字", ephemeral=True)
+
+@tree.command(name="list_filters", description="列出目前過濾關鍵字")
+async def list_filters(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    filters = config.get(guild_id, {}).get("filters", [])
+    if not filters:
+        await interaction.response.send_message("目前沒有設定過濾關鍵字（全部郵件都會轉發）", ephemeral=True)
+    else:
+        await interaction.response.send_message("目前過濾關鍵字：\n" + "\n".join(f"- `{f}`" for f in filters), ephemeral=True)
+
+@tree.command(name="check_now", description="立刻檢查信箱並轉發符合條件的郵件")
 async def check_now(interaction: discord.Interaction):
-    await interaction.response.send_message("🔍 正在檢查信箱...", ephemeral=True)
+    await interaction.response.send_message("🔍 正在檢查信箱並準備轉發...", ephemeral=True)
+    
     emails = await fetch_new_emails()
-    await interaction.followup.send(f"✅ 檢查完成！本次發現 {len(emails)} 封未讀郵件", ephemeral=True)
+    
+    if not emails:
+        await interaction.followup.send("✅ 檢查完成！沒有發現新的未讀郵件。", ephemeral=True)
+        return
+
+    sent_total = 0
+    for guild_id, data in list(config.items()):
+        channel_id = data.get("channel_id")
+        filters = data.get("filters", [])
+        if not channel_id:
+            continue
+
+        channel = client.get_channel(int(channel_id))
+        if channel:
+            sent = await send_emails_to_channel(channel, emails, filters)
+            sent_total += sent
+
+    await interaction.followup.send(
+        f"✅ 檢查完成！發現 {len(emails)} 封新郵件，已轉發 {sent_total} 封符合條件的郵件。",
+        ephemeral=True
+    )
 
 # ================== 啟動 ==================
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
+import warnings
 
 load_dotenv()
 
@@ -19,6 +20,10 @@ PASSWORD = os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER", "tls.mail2000.com.tw")
 IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # 秒
+
+# 隱藏不需要的語音相關警告（PyNaCl、davey）
+warnings.filterwarnings("ignore", message="PyNaCl is not installed")
+warnings.filterwarnings("ignore", message="davey is not installed")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -59,25 +64,22 @@ def decode_body(payload: bytes, charset: str = None):
     """自動偵測並解碼郵件內文（優先 Big5）"""
     if not payload:
         return ""
-    
-    # 常見台灣信箱編碼順序
+   
     encodings = ["utf-8", "big5", "cp950", "gb18030", "iso-8859-1"]
-    
-    # 如果有 charset，先試它
+   
     if charset:
         charset = charset.lower()
         if charset in ["big5", "big5-hkscs", "cp950"]:
             encodings.insert(0, "big5")
         elif charset == "utf-8":
             encodings.insert(0, "utf-8")
-    
+   
     for enc in encodings:
         try:
             return payload.decode(enc, errors="replace")
         except:
             continue
-    
-    # 最後保底
+   
     return payload.decode("utf-8", errors="replace")
 
 # ================== IMAP 抓新郵件 ==================
@@ -104,19 +106,15 @@ def _fetch_sync():
         _, data = mail.search(None, "UNSEEN")
         email_ids = data[0].split() if data and data[0] else []
         emails = []
-
         for num in email_ids[:15]:
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
-
-                # 主旨（加強版）
+                
                 subject = decode_header_text(msg["Subject"])
-
                 from_ = msg["From"] or "未知"
                 date_str = msg["Date"] or "未知時間"
-
-                # 內文（支援 Big5）
+                
                 body = ""
                 if msg.is_multipart():
                     for part in msg.walk():
@@ -129,7 +127,7 @@ def _fetch_sync():
                     payload = msg.get_payload(decode=True)
                     charset = msg.get_content_charset()
                     body = decode_body(payload, charset)
-
+                
                 emails.append({
                     "subject": subject,
                     "from": from_,
@@ -140,7 +138,6 @@ def _fetch_sync():
                 logger.warning(f"解析單封郵件失敗: {e}")
                 continue
 
-        # 標記為已讀
         for num in email_ids:
             try:
                 mail.store(num, "+FLAGS", "\\Seen")

@@ -1,3 +1,9 @@
+import warnings
+
+# ================== 在 import discord 之前就先過濾警告 ==================
+warnings.filterwarnings("ignore", message="PyNaCl is not installed")
+warnings.filterwarnings("ignore", message="davey is not installed")
+
 import discord
 from discord import app_commands
 import asyncio
@@ -9,7 +15,6 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
-import warnings
 
 load_dotenv()
 
@@ -20,10 +25,6 @@ PASSWORD = os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER", "tls.mail2000.com.tw")
 IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # 秒
-
-# 隱藏不需要的語音相關警告（PyNaCl、davey）
-warnings.filterwarnings("ignore", message="PyNaCl is not installed")
-warnings.filterwarnings("ignore", message="davey is not installed")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -45,7 +46,6 @@ load_config()
 
 # ================== 加強版解碼函式（解決 Big5 亂碼） ==================
 def decode_header_text(text):
-    """正確解碼主旨（支援多段 encoded-word）"""
     if not text:
         return "無主旨"
     decoded_parts = decode_header(text)
@@ -61,7 +61,6 @@ def decode_header_text(text):
     return result.strip()
 
 def decode_body(payload: bytes, charset: str = None):
-    """自動偵測並解碼郵件內文（優先 Big5）"""
     if not payload:
         return ""
    

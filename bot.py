@@ -1,6 +1,6 @@
 import warnings
 
-# ================== 在 import discord 之前先過濾警告 ==================
+# 在 import discord 之前過濾警告
 warnings.filterwarnings("ignore", message="PyNaCl is not installed")
 warnings.filterwarnings("ignore", message="davey is not installed")
 
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 import logging
 import io
+from email.message import Message
 
 load_dotenv()
 
@@ -25,7 +26,7 @@ EMAIL = os.getenv("EMAIL")
 PASSWORD = os.getenv("PASSWORD")
 IMAP_SERVER = os.getenv("IMAP_SERVER", "tls.mail2000.com.tw")
 IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # 秒
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -76,13 +77,13 @@ def decode_body(payload: bytes, charset: str = None):
             continue
     return payload.decode("utf-8", errors="replace")
 
-# ================== 提取郵件 + 圖片附件 ==================
+# ================== 提取郵件（支援 HTML + 嵌入圖片） ==================
 async def fetch_new_emails():
     try:
         loop = asyncio.get_running_loop()
         return await asyncio.wait_for(
             loop.run_in_executor(None, _fetch_sync),
-            timeout=40.0
+            timeout=45.0
         )
     except asyncio.TimeoutError:
         logger.error("IMAP 連線超時")
@@ -94,14 +95,14 @@ async def fetch_new_emails():
 def _fetch_sync():
     mail = None
     try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=35)
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=40)
         mail.login(EMAIL, PASSWORD)
         mail.select("INBOX")
         _, data = mail.search(None, "UNSEEN")
         email_ids = data[0].split() if data and data[0] else []
         emails = []
 
-        for num in email_ids[:10]:
+        for num in email_ids[:8]:   # 限制數量
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
@@ -111,27 +112,38 @@ def _fetch_sync():
                 date_str = msg["Date"] or "未知時間"
 
                 body = ""
-                attachments = []
+                attachments = []   # (filename, data)
 
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
-                        content_disposition = str(part.get("Content-Disposition") or "")
+                        disposition = str(part.get("Content-Disposition") or "")
 
-                        # 文字內文
-                        if content_type == "text/plain" and "attachment" not in content_disposition:
+                        # 文字部分
+                        if content_type == "text/plain" and "attachment" not in disposition:
                             payload = part.get_payload(decode=True)
                             charset = part.get_content_charset()
-                            body = decode_body(payload, charset)
+                            if payload:
+                                body = decode_body(payload, charset)
                             continue
 
-                        # 圖片附件
+                        # HTML 部分（優先使用）
+                        if content_type == "text/html" and "attachment" not in disposition:
+                            payload = part.get_payload(decode=True)
+                            charset = part.get_content_charset()
+                            if payload:
+                                html_body = decode_body(payload, charset)
+                                if html_body and len(html_body) > len(body):
+                                    body = html_body  # 使用 HTML 版本（通常較完整）
+
+                        # 圖片附件或嵌入圖片
                         if content_type.startswith("image/"):
                             payload = part.get_payload(decode=True)
                             if payload:
                                 filename = part.get_filename() or f"image_{len(attachments)+1}.jpg"
                                 attachments.append((filename, payload))
                 else:
+                    # 純文字郵件
                     payload = msg.get_payload(decode=True)
                     charset = msg.get_content_charset()
                     body = decode_body(payload, charset)
@@ -140,11 +152,11 @@ def _fetch_sync():
                     "subject": subject,
                     "from": from_,
                     "date": date_str,
-                    "body": body[:1400] + "..." if len(body) > 1400 else body,
+                    "body": body[:1500] + "..." if len(body) > 1500 else body,
                     "attachments": attachments
                 })
             except Exception as e:
-                logger.warning(f"解析單封郵件失敗: {e}")
+                logger.warning(f"解析郵件失敗: {e}")
                 continue
 
         # 標記為已讀
@@ -162,14 +174,7 @@ def _fetch_sync():
             except:
                 pass
 
-# ================== Filter 邏輯 ==================
-def should_send(email_data: dict, filters: list, filter_enabled: bool):
-    if not filter_enabled or not filters:
-        return True
-    text = f"{email_data.get('subject','')} {email_data.get('from','')} {email_data.get('body','')}".lower()
-    return not any(kw.lower() in text for kw in filters if kw)
-
-# ================== 發送到 Discord（支援圖片） ==================
+# ================== 發送到 Discord ==================
 async def send_to_channel(channel, emails, filters, filter_enabled):
     count = 0
     for mail in emails:
@@ -185,15 +190,15 @@ async def send_to_channel(channel, emails, filters, filter_enabled):
         embed.add_field(name="寄件人", value=mail["from"], inline=False)
         embed.add_field(name="時間", value=mail["date"], inline=False)
 
-        status = "✅ 已啟用（排除關鍵字）" if filter_enabled and filters else "❌ 已關閉（全部轉發）"
+        status = "✅ 已啟用" if filter_enabled and filters else "❌ 已關閉（全部轉發）"
         filter_text = " | ".join(filters) if filters else "無關鍵字"
-        embed.set_footer(text=f"Mail2000 自動轉發 • Filter 狀態: {status} | 排除關鍵字: {filter_text}")
+        embed.set_footer(text=f"Mail2000 自動轉發 • Filter: {status} | 排除: {filter_text}")
 
         files = []
         for i, (filename, data) in enumerate(mail.get("attachments", [])):
             file_obj = discord.File(io.BytesIO(data), filename=filename)
             files.append(file_obj)
-            if i == 0:  # 第一張圖片設為 Embed 主圖
+            if i == 0:
                 embed.set_image(url=f"attachment://{filename}")
 
         try:
@@ -202,11 +207,17 @@ async def send_to_channel(channel, emails, filters, filter_enabled):
             else:
                 await channel.send(embed=embed)
             count += 1
-            logger.info(f"✅ 已轉發: {mail['subject'][:60]}... （含 {len(files)} 張圖片）")
+            logger.info(f"轉發成功: {mail['subject'][:50]}... （{len(files)} 張圖片）")
         except Exception as e:
-            logger.error(f"發送郵件失敗: {e}")
+            logger.error(f"發送失敗: {e}")
 
     return count
+
+def should_send(email_data: dict, filters: list, filter_enabled: bool):
+    if not filter_enabled or not filters:
+        return True
+    text = f"{email_data.get('subject','')} {email_data.get('from','')} {email_data.get('body','')}".lower()
+    return not any(kw.lower() in text for kw in filters if kw)
 
 # ================== Discord Bot ==================
 intents = discord.Intents.default()
@@ -237,7 +248,7 @@ async def background_check():
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================== 指令 ==================
-@tree.command(name="set_channel", description="設定接收郵件/公告的頻道（必須先設定）")
+@tree.command(name="set_channel", description="設定接收郵件/公告的頻道")
 @app_commands.describe(channel="目標文字頻道")
 async def set_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     gid = str(interaction.guild_id)
@@ -247,7 +258,7 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
     save_config()
     await interaction.response.send_message(f"✅ 已設定轉發頻道為 {channel.mention}", ephemeral=True)
 
-@tree.command(name="add_filter", description="新增排除關鍵字（含有這些詞的郵件將被擋掉）")
+@tree.command(name="add_filter", description="新增排除關鍵字")
 @app_commands.describe(keyword="關鍵字")
 async def add_filter(interaction: discord.Interaction, keyword: str):
     gid = str(interaction.guild_id)
@@ -257,10 +268,7 @@ async def add_filter(interaction: discord.Interaction, keyword: str):
         config[gid]["filters"].append(keyword)
         config[gid]["filter_enabled"] = True
         save_config()
-        await interaction.response.send_message(
-            f"✅ 已新增**排除關鍵字**：`{keyword}`\nFilter 已自動啟用 → 含有這些關鍵字的郵件將不會轉發",
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"✅ 已新增排除關鍵字：`{keyword}`", ephemeral=True)
     else:
         await interaction.response.send_message("❌ 此關鍵字已存在", ephemeral=True)
 
@@ -273,8 +281,7 @@ async def remove_filter(interaction: discord.Interaction, keyword: str):
         if not config[gid]["filters"]:
             config[gid]["filter_enabled"] = False
         save_config()
-        status = "（目前無排除關鍵字，Filter 已關閉 → 全部轉發）" if not config[gid]["filters"] else ""
-        await interaction.response.send_message(f"✅ 已移除排除關鍵字：`{keyword}`{status}", ephemeral=True)
+        await interaction.response.send_message(f"✅ 已移除排除關鍵字：`{keyword}`", ephemeral=True)
     else:
         await interaction.response.send_message("❌ 找不到此關鍵字", ephemeral=True)
 
@@ -285,20 +292,15 @@ async def list_filters(interaction: discord.Interaction):
     filters = data.get("filters", [])
     filter_enabled = data.get("filter_enabled", False)
     if not filters:
-        await interaction.response.send_message(
-            "目前沒有設定任何排除關鍵字\n"
-            "**Filter 狀態：已關閉** → 所有新郵件都會轉發",
-            ephemeral=True
-        )
+        await interaction.response.send_message("目前沒有設定排除關鍵字 → **全部轉發**", ephemeral=True)
         return
-    status = "✅ 已啟用（含有以下任一關鍵字的郵件將被擋掉）" if filter_enabled else "❌ 已關閉"
+    status = "✅ 已啟用（排除模式）" if filter_enabled else "❌ 已關閉"
     await interaction.response.send_message(
-        f"**Filter 狀態：** {status}\n\n"
-        "排除關鍵字列表：\n" + "\n".join(f"• `{f}`" for f in filters),
+        f"**Filter 狀態：** {status}\n\n排除關鍵字：\n" + "\n".join(f"• `{f}`" for f in filters),
         ephemeral=True
     )
 
-@tree.command(name="toggle_filter", description="手動開啟/關閉排除 Filter")
+@tree.command(name="toggle_filter", description="手動開啟/關閉 Filter")
 async def toggle_filter(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
     if gid not in config:
@@ -307,10 +309,10 @@ async def toggle_filter(interaction: discord.Interaction):
     config[gid]["filter_enabled"] = not current
     if config[gid]["filter_enabled"] and not config[gid].get("filters"):
         config[gid]["filter_enabled"] = False
-        await interaction.response.send_message("❌ 請先使用 `/add_filter` 新增排除關鍵字後才能開啟 Filter", ephemeral=True)
+        await interaction.response.send_message("❌ 請先新增關鍵字才能開啟 Filter", ephemeral=True)
         return
     save_config()
-    status = "✅ **已開啟**（排除模式：含有關鍵字的郵件不會轉發）" if config[gid]["filter_enabled"] else "❌ **已關閉**（全部轉發）"
+    status = "✅ 已開啟（排除關鍵字）" if config[gid]["filter_enabled"] else "❌ 已關閉（全部轉發）"
     await interaction.response.send_message(f"Filter 狀態切換成功！\n{status}", ephemeral=True)
 
 @tree.command(name="check_now", description="立刻手動檢查一次新郵件")
@@ -330,9 +332,6 @@ async def check_now(interaction: discord.Interaction):
             if ch:
                 sent = await send_to_channel(ch, emails, filters, filter_enabled)
                 sent_total += sent
-    await interaction.followup.send(
-        f"✅ 檢查完成！\n發現 {len(emails)} 封新郵件，已轉發 {sent_total} 封。",
-        ephemeral=True
-    )
+    await interaction.followup.send(f"✅ 檢查完成！發現 {len(emails)} 封新郵件，已轉發 {sent_total} 封。", ephemeral=True)
 
 client.run(TOKEN)

@@ -1,9 +1,3 @@
-import warnings
-
-# ================== 在 import discord 之前就先過濾警告 ==================
-warnings.filterwarnings("ignore", message="PyNaCl is not installed")
-warnings.filterwarnings("ignore", message="davey is not installed")
-
 import discord
 from discord import app_commands
 import asyncio
@@ -30,6 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = "config.json"
+
 config = {}
 
 def load_config():
@@ -43,43 +38,6 @@ def save_config():
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 load_config()
-
-# ================== 加強版解碼函式（解決 Big5 亂碼） ==================
-def decode_header_text(text):
-    if not text:
-        return "無主旨"
-    decoded_parts = decode_header(text)
-    result = ""
-    for part, enc in decoded_parts:
-        if isinstance(part, bytes):
-            try:
-                result += part.decode(enc or "utf-8", errors="replace")
-            except:
-                result += part.decode("utf-8", errors="replace")
-        else:
-            result += part
-    return result.strip()
-
-def decode_body(payload: bytes, charset: str = None):
-    if not payload:
-        return ""
-   
-    encodings = ["utf-8", "big5", "cp950", "gb18030", "iso-8859-1"]
-   
-    if charset:
-        charset = charset.lower()
-        if charset in ["big5", "big5-hkscs", "cp950"]:
-            encodings.insert(0, "big5")
-        elif charset == "utf-8":
-            encodings.insert(0, "utf-8")
-   
-    for enc in encodings:
-        try:
-            return payload.decode(enc, errors="replace")
-        except:
-            continue
-   
-    return payload.decode("utf-8", errors="replace")
 
 # ================== IMAP 抓新郵件 ==================
 async def fetch_new_emails():
@@ -109,32 +67,33 @@ def _fetch_sync():
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
                 msg = email.message_from_bytes(msg_data[0][1])
-                
-                subject = decode_header_text(msg["Subject"])
+
+                subject = msg["Subject"] or "無主旨"
+                if subject:
+                    decoded = decode_header(subject)[0]
+                    subject = decoded[0]
+                    if isinstance(subject, bytes):
+                        subject = subject.decode(decoded[1] or "utf-8", errors="replace")
+
                 from_ = msg["From"] or "未知"
                 date_str = msg["Date"] or "未知時間"
-                
+
                 body = ""
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == "text/plain":
-                            payload = part.get_payload(decode=True)
-                            charset = part.get_content_charset()
-                            body = decode_body(payload, charset)
+                            body = part.get_payload(decode=True).decode("utf-8", errors="replace")
                             break
                 else:
-                    payload = msg.get_payload(decode=True)
-                    charset = msg.get_content_charset()
-                    body = decode_body(payload, charset)
-                
+                    body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+
                 emails.append({
                     "subject": subject,
                     "from": from_,
                     "date": date_str,
                     "body": body[:1400] + "..." if len(body) > 1400 else body,
                 })
-            except Exception as e:
-                logger.warning(f"解析單封郵件失敗: {e}")
+            except:
                 continue
 
         for num in email_ids:
@@ -204,10 +163,13 @@ async def background_check():
                 channel_id = data.get("channel_id")
                 filters = data.get("filters", [])
                 filter_enabled = data.get("filter_enabled", False)
+
                 if channel_id:
                     channel = client.get_channel(int(channel_id))
                     if channel:
                         await send_to_channel(channel, emails, filters, filter_enabled)
+                    else:
+                        logger.warning(f"背景檢查 → guild {guild_id} 的頻道 {channel_id} 找不到，跳過")
         await asyncio.sleep(CHECK_INTERVAL)
 
 # ================== 指令 ==================
@@ -219,91 +181,88 @@ async def set_channel(interaction: discord.Interaction, channel: discord.TextCha
         config[gid] = {"filters": [], "filter_enabled": False}
     config[gid]["channel_id"] = channel.id
     save_config()
-    await interaction.response.send_message(f"✅ 已設定轉發頻道為 {channel.mention}", ephemeral=True)
+    await interaction.response.send_message(f"✅ 已設定轉發頻道為 {channel.mention}\n現在可以用 `/check_now` 測試！", ephemeral=True)
 
-@tree.command(name="add_filter", description="新增排除關鍵字（含有這些詞的郵件將被擋掉）")
-@app_commands.describe(keyword="關鍵字")
-async def add_filter(interaction: discord.Interaction, keyword: str):
-    gid = str(interaction.guild_id)
-    if gid not in config:
-        config[gid] = {"filters": [], "filter_enabled": False, "channel_id": None}
-    if keyword not in config[gid]["filters"]:
-        config[gid]["filters"].append(keyword)
-        config[gid]["filter_enabled"] = True
-        save_config()
-        await interaction.response.send_message(
-            f"✅ 已新增**排除關鍵字**：`{keyword}`\nFilter 已自動啟用 → 含有這些關鍵字的郵件將不會轉發",
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message("❌ 此關鍵字已存在", ephemeral=True)
-
-@tree.command(name="remove_filter", description="移除排除關鍵字")
-@app_commands.describe(keyword="關鍵字")
-async def remove_filter(interaction: discord.Interaction, keyword: str):
-    gid = str(interaction.guild_id)
-    if gid in config and keyword in config[gid].get("filters", []):
-        config[gid]["filters"].remove(keyword)
-        if not config[gid]["filters"]:
-            config[gid]["filter_enabled"] = False
-        save_config()
-        status = "（目前無排除關鍵字，Filter 已關閉 → 全部轉發）" if not config[gid]["filters"] else ""
-        await interaction.response.send_message(f"✅ 已移除排除關鍵字：`{keyword}`{status}", ephemeral=True)
-    else:
-        await interaction.response.send_message("❌ 找不到此關鍵字", ephemeral=True)
-
-@tree.command(name="list_filters", description="查看目前排除關鍵字與 Filter 狀態")
+@tree.command(name="list_filters", description="查看目前設定狀態（包含頻道 & Filter）")
 async def list_filters(interaction: discord.Interaction):
     gid = str(interaction.guild_id)
     data = config.get(gid, {})
     filters = data.get("filters", [])
     filter_enabled = data.get("filter_enabled", False)
+    channel_id = data.get("channel_id")
+
+    if channel_id:
+        channel = client.get_channel(int(channel_id))
+        channel_status = f"✅ 已設定 → {channel.mention if channel else f'<#{channel_id}>'}"
+    else:
+        channel_status = "❌ 尚未設定轉發頻道（請先使用 `/set_channel`）"
+
     if not filters:
         await interaction.response.send_message(
+            f"{channel_status}\n\n"
             "目前沒有設定任何排除關鍵字\n"
             "**Filter 狀態：已關閉** → 所有新郵件都會轉發",
             ephemeral=True
         )
         return
+
     status = "✅ 已啟用（含有以下任一關鍵字的郵件將被擋掉）" if filter_enabled else "❌ 已關閉"
     await interaction.response.send_message(
+        f"{channel_status}\n\n"
         f"**Filter 狀態：** {status}\n\n"
         "排除關鍵字列表：\n" + "\n".join(f"• `{f}`" for f in filters),
         ephemeral=True
     )
 
-@tree.command(name="toggle_filter", description="手動開啟/關閉排除 Filter")
-async def toggle_filter(interaction: discord.Interaction):
-    gid = str(interaction.guild_id)
-    if gid not in config:
-        config[gid] = {"filters": [], "filter_enabled": False, "channel_id": None}
-    current = config[gid].get("filter_enabled", False)
-    config[gid]["filter_enabled"] = not current
-    if config[gid]["filter_enabled"] and not config[gid].get("filters"):
-        config[gid]["filter_enabled"] = False
-        await interaction.response.send_message("❌ 請先使用 `/add_filter` 新增排除關鍵字後才能開啟 Filter", ephemeral=True)
-        return
-    save_config()
-    status = "✅ **已開啟**（排除模式：含有關鍵字的郵件不會轉發）" if config[gid]["filter_enabled"] else "❌ **已關閉**（全部轉發）"
-    await interaction.response.send_message(f"Filter 狀態切換成功！\n{status}", ephemeral=True)
-
 @tree.command(name="check_now", description="立刻手動檢查一次新郵件")
 async def check_now(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+
+    # 先檢查當前伺服器是否有設定頻道
+    gid = str(interaction.guild_id)
+    data = config.get(gid, {})
+    ch_id = data.get("channel_id")
+
+    if not ch_id:
+        await interaction.followup.send(
+            "❌ **尚未設定轉發頻道！**\n"
+            "請先使用 `/set_channel` 設定接收郵件的文字頻道。",
+            ephemeral=True
+        )
+        return
+
+    channel = client.get_channel(int(ch_id))
+    if not channel:
+        await interaction.followup.send(
+            f"❌ **找不到轉發頻道！**\n"
+            f"已設定的頻道 ID: `{ch_id}`\n\n"
+            "請確認：\n"
+            "1. 機器人有該頻道的「查看頻道」與「傳送訊息」權限\n"
+            "2. 頻道是否已被刪除\n"
+            "3. 重新執行 `/set_channel` 設定一次",
+            ephemeral=True
+        )
+        return
+
     emails = await fetch_new_emails()
     if not emails:
         await interaction.followup.send("✅ 沒有新的未讀郵件。", ephemeral=True)
         return
+
     sent_total = 0
-    for gid, data in list(config.items()):
+    for guild_id, data in list(config.items()):
         ch_id = data.get("channel_id")
         filters = data.get("filters", [])
         filter_enabled = data.get("filter_enabled", False)
+
         if ch_id:
             ch = client.get_channel(int(ch_id))
             if ch:
                 sent = await send_to_channel(ch, emails, filters, filter_enabled)
                 sent_total += sent
+            else:
+                logger.warning(f"check_now → guild {guild_id} 的頻道 {ch_id} 找不到")
+
     await interaction.followup.send(
         f"✅ 檢查完成！\n發現 {len(emails)} 封新郵件，已轉發 {sent_total} 封。",
         ephemeral=True
